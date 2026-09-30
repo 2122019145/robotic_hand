@@ -1,0 +1,1819 @@
+#include <Servo.h>
+
+
+// ============================================================
+//                    1. 舵机对象
+// ============================================================
+
+Servo base;     // b：底座
+Servo rArm;     // r：大臂
+Servo fArm;     // f：小臂
+Servo claw;     // c：爪子
+
+
+// ============================================================
+//                    2. 舵机引脚
+// ============================================================
+
+const int BASE_PIN = 9;
+const int RARM_PIN = 8;
+const int FARM_PIN = 7;
+const int CLAW_PIN = 6;
+
+
+// ============================================================
+//                    3. 摇杆引脚
+// ============================================================
+
+// 按照你目前的接线
+const int JOY_BASE = A0;
+const int JOY_RARM = A1;
+const int JOY_FARM = A2;
+const int JOY_CLAW = A3;
+
+
+// ============================================================
+//                    4. 舵机角度限制
+// ============================================================
+
+// 底座 b
+const int BASE_MIN = 0;
+const int BASE_MAX = 180;
+
+// 大臂 r
+const int RARM_MIN = 45;
+const int RARM_MAX = 105;
+
+// 小臂 f
+const int FARM_MIN = 60;
+const int FARM_MAX = 150;
+
+// 爪子 c
+const int CLAW_MIN = 0;
+const int CLAW_MAX = 110;
+
+
+// ============================================================
+//                    5. 当前舵机角度
+// ============================================================
+
+// 这些变量非常重要。
+// 它们表示“舵机当前所在的位置”。
+
+int baseAngle = 90;
+int rArmAngle = 90;
+int fArmAngle = 90;
+int clawAngle = 90;
+
+
+// ============================================================
+//                    6. 自动运动目标角度
+// ============================================================
+
+// 串口发送 x/y/z 指令时使用。
+// 例如：x120,y80,z100
+
+int baseTarget = 90;
+int rArmTarget = 90;
+int fArmTarget = 90;
+int clawTarget = 90;
+
+
+// ============================================================
+//                    7. 自动运动状态
+// ============================================================
+
+// true：正在执行串口自动运动
+// false：没有自动运动
+
+bool autoMoving = false;
+
+
+// ============================================================
+//                    8. 摇杆参数
+// ============================================================
+
+// Arduino 模拟输入范围：0~1023
+// 摇杆中心通常约为 512
+
+const int JOY_CENTER = 512;
+
+
+// 摇杆死区
+// 防止摇杆没有完全回中时舵机自己移动
+
+const int DEAD_ZONE = 80;
+
+
+// ============================================================
+//                    9. 速度参数
+// ============================================================
+
+// 摇杆每改变 1°，至少间隔多少毫秒
+//
+// 数值越大 = 越慢
+// 数值越小 = 越快
+//
+// 现在设置为 60ms
+// 大约 16°/秒
+
+int moveInterval = 60;
+
+
+// H 最快速度限制
+const int FASTEST = 20;
+
+
+// L 最慢速度限制
+const int SLOWEST = 150;
+
+
+// ============================================================
+//                    10. 四个舵机独立计时
+// ============================================================
+
+// 以前你的代码四个舵机共用一个 lastMoveTime。
+// 这样会造成四个舵机互相影响。
+//
+// 现在每个舵机都有自己的计时器。
+
+unsigned long lastBaseMove = 0;
+unsigned long lastRArmMove = 0;
+unsigned long lastFArmMove = 0;
+unsigned long lastClawMove = 0;
+
+
+// ============================================================
+//                    11. 初始化
+// ============================================================
+
+void setup()
+{
+    Serial.begin(9600);
+
+
+    // -------------------------
+    // 连接四个舵机
+    // -------------------------
+
+    base.attach(BASE_PIN);
+    rArm.attach(RARM_PIN);
+    fArm.attach(FARM_PIN);
+    claw.attach(CLAW_PIN);
+
+
+    // -------------------------
+    // 设置初始位置
+    // -------------------------
+
+    base.write(baseAngle);
+    delay(100);
+
+    rArm.write(rArmAngle);
+    delay(100);
+
+    fArm.write(fArmAngle);
+    delay(100);
+
+    claw.write(clawAngle);
+    delay(100);
+
+
+    // -------------------------
+    // 串口提示
+    // -------------------------
+
+    Serial.println("================================");
+    Serial.println("机械臂控制系统启动");
+    Serial.println("================================");
+
+    Serial.println("摇杆：控制四个舵机");
+
+    Serial.println("O = 张开爪子");
+    Serial.println("S = 关闭爪子");
+
+    Serial.println("H = 加快速度");
+    Serial.println("L = 降低速度");
+
+    Serial.println("多舵机指令：");
+    Serial.println("例如：x120,y80,z100");
+
+    Serial.println("================================");
+}
+
+
+// ============================================================
+//              12. 判断某个摇杆是否被推动
+// ============================================================
+
+bool joystickMoved(int joystickValue)
+{
+    int difference = joystickValue - JOY_CENTER;
+
+    if (abs(difference) >= DEAD_ZONE)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+
+// ============================================================
+//              13. 摇杆控制一个舵机
+// ============================================================
+//
+// 这个函数与以前最大的区别：
+//
+// 摇杆控制时，直接修改“当前角度”。
+// 不会重新计算一个固定目标。
+//
+// 所以松开摇杆以后：
+//
+// 舵机停在哪里，就停在哪里。
+//
+// ============================================================
+
+void controlJoystickServo(
+    int joystickValue,
+    int &servoAngle,
+    Servo &servo,
+    int minAngle,
+    int maxAngle,
+    unsigned long &lastMove,
+    bool reverseDirection
+)
+{
+    unsigned long currentTime = millis();
+
+
+    // -------------------------
+    // 判断是否到了下一次运动时间
+    // -------------------------
+
+    if (currentTime - lastMove < moveInterval)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 计算摇杆偏移量
+    // -------------------------
+
+    int difference = joystickValue - JOY_CENTER;
+
+
+    // -------------------------
+    // 死区
+    // -------------------------
+
+    if (abs(difference) < DEAD_ZONE)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 根据摇杆方向改变角度
+    // -------------------------
+
+  if (difference > 0)
+{
+    if (reverseDirection)
+        servoAngle--;
+    else
+        servoAngle++;
+}
+else
+{
+    if (reverseDirection)
+        servoAngle++;
+    else
+        servoAngle--;
+}
+
+
+    // -------------------------
+    // 限制角度
+    // -------------------------
+
+    servoAngle = constrain(
+        servoAngle,
+        minAngle,
+        maxAngle
+    );
+
+
+    // -------------------------
+    // 输出舵机
+    // -------------------------
+
+    servo.write(servoAngle);
+
+
+    // -------------------------
+    // 记录时间
+    // -------------------------
+
+    lastMove = currentTime;
+}
+
+
+// ============================================================
+//              14. 摇杆控制系统
+// ============================================================
+
+void joystickControl()
+{
+    // -------------------------
+    // 读取四个摇杆
+    // -------------------------
+
+    int baseJoy = analogRead(JOY_BASE);
+    int rArmJoy = analogRead(JOY_RARM);
+    int fArmJoy = analogRead(JOY_FARM);
+    int clawJoy = analogRead(JOY_CLAW);
+
+
+    // -------------------------
+    // 判断是否有人正在操作摇杆
+    // -------------------------
+
+    bool joystickIsMoving =
+        joystickMoved(baseJoy) ||
+        joystickMoved(rArmJoy) ||
+        joystickMoved(fArmJoy) ||
+        joystickMoved(clawJoy);
+
+
+    // -------------------------
+    // 如果摇杆被操作
+    //
+    // 说明人工操作优先。
+    //
+    // 取消正在执行的自动运动。
+    // -------------------------
+
+    if (joystickIsMoving)
+    {
+        autoMoving = false;
+
+
+        // 非常重要：
+        //
+        // 自动运动被取消以后，
+        // 目标角度必须同步到当前角度。
+        //
+        // 否则松开摇杆后，
+        // 自动运动可能又把舵机拉回去。
+
+        baseTarget = baseAngle;
+        rArmTarget = rArmAngle;
+        fArmTarget = fArmAngle;
+        clawTarget = clawAngle;
+    }
+
+
+    // -------------------------
+    // 控制四个舵机
+    // -------------------------
+
+// 底座：方向反转
+controlJoystickServo(
+    baseJoy,
+    baseAngle,
+    base,
+    BASE_MIN,
+    BASE_MAX,
+    lastBaseMove,
+    true
+);
+
+
+// 大臂：正常
+controlJoystickServo(
+    rArmJoy,
+    rArmAngle,
+    rArm,
+    RARM_MIN,
+    RARM_MAX,
+    lastRArmMove,
+    false
+);
+
+
+// 小臂：方向反转
+controlJoystickServo(
+    fArmJoy,
+    fArmAngle,
+    fArm,
+    FARM_MIN,
+    FARM_MAX,
+    lastFArmMove,
+    true
+);
+
+
+// 爪子：正常
+controlJoystickServo(
+    clawJoy,
+    clawAngle,
+    claw,
+    CLAW_MIN,
+    CLAW_MAX,
+    lastClawMove,
+    false
+);
+}
+
+
+// ============================================================
+//              15. 自动移动一个舵机
+// ============================================================
+
+void moveServoToTarget(
+    int &currentAngle,
+    int targetAngle,
+    Servo &servo,
+    unsigned long &lastMove
+)
+{
+    unsigned long currentTime = millis();
+
+
+    // -------------------------
+    // 判断运动时间
+    // -------------------------
+
+    if (currentTime - lastMove < moveInterval)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 如果已经到目标
+    // -------------------------
+
+    if (currentAngle == targetAngle)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 向目标靠近 1°
+    // -------------------------
+
+    if (currentAngle < targetAngle)
+    {
+        currentAngle++;
+    }
+    else
+    {
+        currentAngle--;
+    }
+
+
+    // -------------------------
+    // 输出
+    // -------------------------
+
+    servo.write(currentAngle);
+
+
+    // -------------------------
+    // 记录时间
+    // -------------------------
+
+    lastMove = currentTime;
+}
+
+
+// ============================================================
+//              16. 自动运动系统
+// ============================================================
+
+void updateAutoMovement()
+{
+    // 如果没有自动运动
+    // 直接退出
+
+    if (!autoMoving)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 四个舵机分别向目标移动
+    // -------------------------
+
+    moveServoToTarget(
+        baseAngle,
+        baseTarget,
+        base,
+        lastBaseMove
+    );
+
+
+    moveServoToTarget(
+        rArmAngle,
+        rArmTarget,
+        rArm,
+        lastRArmMove
+    );
+
+
+    moveServoToTarget(
+        fArmAngle,
+        fArmTarget,
+        fArm,
+        lastFArmMove
+    );
+
+
+    moveServoToTarget(
+        clawAngle,
+        clawTarget,
+        claw,
+        lastClawMove
+    );
+
+
+    // -------------------------
+    // 判断是否全部到达
+    // -------------------------
+
+    if (
+        baseAngle == baseTarget &&
+        rArmAngle == rArmTarget &&
+        fArmAngle == fArmTarget &&
+        clawAngle == clawTarget
+    )
+    {
+        autoMoving = false;
+
+        Serial.println("自动运动完成");
+    }
+}
+
+
+// ============================================================
+//                    17. 张开爪子
+// ============================================================
+void openClaw()
+{
+    clawTarget = CLAW_MIN;
+    autoMoving = true;
+
+    Serial.println("爪子：张开");
+}
+
+
+// ============================================================
+//                    18. 关闭爪子
+// ============================================================
+void closeClaw()
+{
+    clawTarget = CLAW_MAX;
+    autoMoving = true;
+
+    Serial.println("爪子：关闭");
+}
+
+
+
+// ============================================================
+//                    19. 加快速度
+// ============================================================
+
+void increaseSpeed()
+{
+    moveInterval -= 10;
+
+
+    if (moveInterval < FASTEST)
+    {
+        moveInterval = FASTEST;
+    }
+
+
+    Serial.print("速度提高，当前间隔：");
+    Serial.print(moveInterval);
+    Serial.println(" ms");
+}
+
+
+// ============================================================
+//                    20. 降低速度
+// ============================================================
+
+void decreaseSpeed()
+{
+    moveInterval += 10;
+
+
+    if (moveInterval > SLOWEST)
+    {
+        moveInterval = SLOWEST;
+    }
+
+
+    Serial.print("速度降低，当前间隔：");
+    Serial.print(moveInterval);
+    Serial.println(" ms");
+}
+
+
+// ============================================================
+//              21. 多舵机协同控制
+// ============================================================
+//
+// 指令格式：
+//
+// x120,y80,z100
+//
+// 我们规定：
+//
+// x → base
+// y → rArm
+// z → fArm
+//
+// 注意：
+// 这里的数字是“绝对角度”
+//
+// 例如：
+//
+// x120,y80,z100
+//
+// 表示：
+// 底座 → 120°
+// 大臂 → 80°
+// 小臂 → 100°
+//
+// ============================================================
+
+void multiServoControl(String command)
+{
+    // -------------------------
+    // 找到 x y z
+    // -------------------------
+
+    int xIndex = command.indexOf('x');
+    int yIndex = command.indexOf('y');
+    int zIndex = command.indexOf('z');
+
+
+    // 同时兼容大写 X Y Z
+
+    if (xIndex == -1)
+    {
+        xIndex = command.indexOf('X');
+    }
+
+    if (yIndex == -1)
+    {
+        yIndex = command.indexOf('Y');
+    }
+
+    if (zIndex == -1)
+    {
+        zIndex = command.indexOf('Z');
+    }
+
+
+    // -------------------------
+    // 找逗号
+    // -------------------------
+
+    int comma1 = command.indexOf(',');
+    int comma2 = command.indexOf(',', comma1 + 1);
+
+
+    // -------------------------
+    // 检查格式
+    // -------------------------
+
+    if (
+        xIndex == -1 ||
+        yIndex == -1 ||
+        zIndex == -1 ||
+        comma1 == -1 ||
+        comma2 == -1
+    )
+    {
+        Serial.println("指令格式错误！");
+        Serial.println("正确格式：x120,y80,z100");
+
+        return;
+    }
+
+
+    // -------------------------
+    // 解析 x
+    // -------------------------
+
+    int xAngle = command.substring(
+        xIndex + 1,
+        comma1
+    ).toInt();
+
+
+    // -------------------------
+    // 解析 y
+    // -------------------------
+
+    int yAngle = command.substring(
+        yIndex + 1,
+        comma2
+    ).toInt();
+
+
+    // -------------------------
+    // 解析 z
+    // -------------------------
+
+    int zAngle = command.substring(
+        zIndex + 1
+    ).toInt();
+
+
+    // -------------------------
+    // 限制角度
+    // -------------------------
+
+    xAngle = constrain(
+        xAngle,
+        BASE_MIN,
+        BASE_MAX
+    );
+
+
+    yAngle = constrain(
+        yAngle,
+        RARM_MIN,
+        RARM_MAX
+    );
+
+
+    zAngle = constrain(
+        zAngle,
+        FARM_MIN,
+        FARM_MAX
+    );
+
+
+    // -------------------------
+    // 设置目标角度
+    // -------------------------
+
+    baseTarget = xAngle;
+    rArmTarget = yAngle;
+    fArmTarget = zAngle;
+
+
+    // -------------------------
+    // 开启自动运动
+    // -------------------------
+
+    autoMoving = true;
+
+
+    // -------------------------
+    // 输出信息
+    // -------------------------
+
+    Serial.println("收到多舵机目标：");
+
+    Serial.print("Base = ");
+    Serial.println(baseTarget);
+
+    Serial.print("rArm = ");
+    Serial.println(rArmTarget);
+
+    Serial.print("fArm = ");
+    Serial.println(fArmTarget);
+}
+
+
+// ============================================================
+//                    22. 串口控制
+// ============================================================
+
+void serialControl()
+{
+    if (Serial.available() <= 0)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 读取一整行
+    // -------------------------
+
+    String command = Serial.readStringUntil('\n');
+
+    command.trim();
+
+
+    // -------------------------
+    // 空指令
+    // -------------------------
+
+    if (command.length() == 0)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // 固定指令
+    // ========================================================
+
+    if (command == "O" || command == "o")
+    {
+        openClaw();
+    }
+
+
+    else if (command == "S" || command == "s")
+    {
+        closeClaw();
+    }
+
+
+    else if (command == "H" || command == "h")
+    {
+        increaseSpeed();
+    }
+
+
+    else if (command == "L" || command == "l")
+    {
+        decreaseSpeed();
+    }
+
+
+    // ========================================================
+    // 多舵机指令
+    // ========================================================
+
+    else if (
+        command.indexOf('x') != -1 ||
+        command.indexOf('X') != -1
+    )
+    {
+        multiServoControl(command);
+    }
+
+
+    // ========================================================
+    // 未知指令
+    // ========================================================
+
+    else
+    {
+        Serial.print("未知指令：");
+        Serial.println(command);
+    }
+}
+
+
+// ============================================================
+//                    23. 主循环
+// ============================================================
+
+void loop()
+{
+    // -------------------------
+    // 处理电脑串口
+    // -------------------------
+
+    serialControl();
+
+
+    // -------------------------
+    // 处理摇杆
+    // -------------------------
+
+    joystickControl();
+
+
+    // -------------------------
+    // 处理自动运动
+    // -------------------------
+
+    updateAutoMovement();
+}#include <Servo.h>
+
+
+// ============================================================
+//                    1. 舵机对象
+// ============================================================
+
+Servo base;     // b：底座
+Servo rArm;     // r：大臂
+Servo fArm;     // f：小臂
+Servo claw;     // c：爪子
+
+
+// ============================================================
+//                    2. 舵机引脚
+// ============================================================
+
+const int BASE_PIN = 9;
+const int RARM_PIN = 8;
+const int FARM_PIN = 7;
+const int CLAW_PIN = 6;
+
+
+// ============================================================
+//                    3. 摇杆引脚
+// ============================================================
+
+// 按照你目前的接线
+const int JOY_BASE = A0;
+const int JOY_RARM = A1;
+const int JOY_FARM = A2;
+const int JOY_CLAW = A3;
+
+
+// ============================================================
+//                    4. 舵机角度限制
+// ============================================================
+
+// 底座 b
+const int BASE_MIN = 0;
+const int BASE_MAX = 180;
+
+// 大臂 r
+const int RARM_MIN = 45;
+const int RARM_MAX = 105;
+
+// 小臂 f
+const int FARM_MIN = 60;
+const int FARM_MAX = 150;
+
+// 爪子 c
+const int CLAW_MIN = 0;
+const int CLAW_MAX = 110;
+
+
+// ============================================================
+//                    5. 当前舵机角度
+// ============================================================
+
+// 这些变量非常重要。
+// 它们表示“舵机当前所在的位置”。
+
+int baseAngle = 90;
+int rArmAngle = 90;
+int fArmAngle = 90;
+int clawAngle = 90;
+
+
+// ============================================================
+//                    6. 自动运动目标角度
+// ============================================================
+
+// 串口发送 x/y/z 指令时使用。
+// 例如：x120,y80,z100
+
+int baseTarget = 90;
+int rArmTarget = 90;
+int fArmTarget = 90;
+int clawTarget = 90;
+
+
+// ============================================================
+//                    7. 自动运动状态
+// ============================================================
+
+// true：正在执行串口自动运动
+// false：没有自动运动
+
+bool autoMoving = false;
+
+
+// ============================================================
+//                    8. 摇杆参数
+// ============================================================
+
+// Arduino 模拟输入范围：0~1023
+// 摇杆中心通常约为 512
+
+const int JOY_CENTER = 512;
+
+
+// 摇杆死区
+// 防止摇杆没有完全回中时舵机自己移动
+
+const int DEAD_ZONE = 80;
+
+
+// ============================================================
+//                    9. 速度参数
+// ============================================================
+
+// 摇杆每改变 1°，至少间隔多少毫秒
+//
+// 数值越大 = 越慢
+// 数值越小 = 越快
+//
+// 现在设置为 60ms
+// 大约 16°/秒
+
+int moveInterval = 60;
+
+
+// H 最快速度限制
+const int FASTEST = 20;
+
+
+// L 最慢速度限制
+const int SLOWEST = 150;
+
+
+// ============================================================
+//                    10. 四个舵机独立计时
+// ============================================================
+
+// 以前你的代码四个舵机共用一个 lastMoveTime。
+// 这样会造成四个舵机互相影响。
+//
+// 现在每个舵机都有自己的计时器。
+
+unsigned long lastBaseMove = 0;
+unsigned long lastRArmMove = 0;
+unsigned long lastFArmMove = 0;
+unsigned long lastClawMove = 0;
+
+
+// ============================================================
+//                    11. 初始化
+// ============================================================
+
+void setup()
+{
+    Serial.begin(9600);
+
+
+    // -------------------------
+    // 连接四个舵机
+    // -------------------------
+
+    base.attach(BASE_PIN);
+    rArm.attach(RARM_PIN);
+    fArm.attach(FARM_PIN);
+    claw.attach(CLAW_PIN);
+
+
+    // -------------------------
+    // 设置初始位置
+    // -------------------------
+
+    base.write(baseAngle);
+    delay(100);
+
+    rArm.write(rArmAngle);
+    delay(100);
+
+    fArm.write(fArmAngle);
+    delay(100);
+
+    claw.write(clawAngle);
+    delay(100);
+
+
+    // -------------------------
+    // 串口提示
+    // -------------------------
+
+    Serial.println("================================");
+    Serial.println("机械臂控制系统启动");
+    Serial.println("================================");
+
+    Serial.println("摇杆：控制四个舵机");
+
+    Serial.println("O = 张开爪子");
+    Serial.println("S = 关闭爪子");
+
+    Serial.println("H = 加快速度");
+    Serial.println("L = 降低速度");
+
+    Serial.println("多舵机指令：");
+    Serial.println("例如：x120,y80,z100");
+
+    Serial.println("================================");
+}
+
+
+// ============================================================
+//              12. 判断某个摇杆是否被推动
+// ============================================================
+
+bool joystickMoved(int joystickValue)
+{
+    int difference = joystickValue - JOY_CENTER;
+
+    if (abs(difference) >= DEAD_ZONE)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+
+// ============================================================
+//              13. 摇杆控制一个舵机
+// ============================================================
+//
+// 这个函数与以前最大的区别：
+//
+// 摇杆控制时，直接修改“当前角度”。
+// 不会重新计算一个固定目标。
+//
+// 所以松开摇杆以后：
+//
+// 舵机停在哪里，就停在哪里。
+//
+// ============================================================
+
+void controlJoystickServo(
+    int joystickValue,
+    int &servoAngle,
+    Servo &servo,
+    int minAngle,
+    int maxAngle,
+    unsigned long &lastMove,
+    bool reverseDirection
+)
+{
+    unsigned long currentTime = millis();
+
+
+    // -------------------------
+    // 判断是否到了下一次运动时间
+    // -------------------------
+
+    if (currentTime - lastMove < moveInterval)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 计算摇杆偏移量
+    // -------------------------
+
+    int difference = joystickValue - JOY_CENTER;
+
+
+    // -------------------------
+    // 死区
+    // -------------------------
+
+    if (abs(difference) < DEAD_ZONE)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 根据摇杆方向改变角度
+    // -------------------------
+
+  if (difference > 0)
+{
+    if (reverseDirection)
+        servoAngle--;
+    else
+        servoAngle++;
+}
+else
+{
+    if (reverseDirection)
+        servoAngle++;
+    else
+        servoAngle--;
+}
+
+
+    // -------------------------
+    // 限制角度
+    // -------------------------
+
+    servoAngle = constrain(
+        servoAngle,
+        minAngle,
+        maxAngle
+    );
+
+
+    // -------------------------
+    // 输出舵机
+    // -------------------------
+
+    servo.write(servoAngle);
+
+
+    // -------------------------
+    // 记录时间
+    // -------------------------
+
+    lastMove = currentTime;
+}
+
+
+// ============================================================
+//              14. 摇杆控制系统
+// ============================================================
+
+void joystickControl()
+{
+    // -------------------------
+    // 读取四个摇杆
+    // -------------------------
+
+    int baseJoy = analogRead(JOY_BASE);
+    int rArmJoy = analogRead(JOY_RARM);
+    int fArmJoy = analogRead(JOY_FARM);
+    int clawJoy = analogRead(JOY_CLAW);
+
+
+    // -------------------------
+    // 判断是否有人正在操作摇杆
+    // -------------------------
+
+    bool joystickIsMoving =
+        joystickMoved(baseJoy) ||
+        joystickMoved(rArmJoy) ||
+        joystickMoved(fArmJoy) ||
+        joystickMoved(clawJoy);
+
+
+    // -------------------------
+    // 如果摇杆被操作
+    //
+    // 说明人工操作优先。
+    //
+    // 取消正在执行的自动运动。
+    // -------------------------
+
+    if (joystickIsMoving)
+    {
+        autoMoving = false;
+
+
+        // 非常重要：
+        //
+        // 自动运动被取消以后，
+        // 目标角度必须同步到当前角度。
+        //
+        // 否则松开摇杆后，
+        // 自动运动可能又把舵机拉回去。
+
+        baseTarget = baseAngle;
+        rArmTarget = rArmAngle;
+        fArmTarget = fArmAngle;
+        clawTarget = clawAngle;
+    }
+
+
+    // -------------------------
+    // 控制四个舵机
+    // -------------------------
+
+// 底座：方向反转
+controlJoystickServo(
+    baseJoy,
+    baseAngle,
+    base,
+    BASE_MIN,
+    BASE_MAX,
+    lastBaseMove,
+    true
+);
+
+
+// 大臂：正常
+controlJoystickServo(
+    rArmJoy,
+    rArmAngle,
+    rArm,
+    RARM_MIN,
+    RARM_MAX,
+    lastRArmMove,
+    false
+);
+
+
+// 小臂：方向反转
+controlJoystickServo(
+    fArmJoy,
+    fArmAngle,
+    fArm,
+    FARM_MIN,
+    FARM_MAX,
+    lastFArmMove,
+    true
+);
+
+
+// 爪子：正常
+controlJoystickServo(
+    clawJoy,
+    clawAngle,
+    claw,
+    CLAW_MIN,
+    CLAW_MAX,
+    lastClawMove,
+    false
+);
+}
+
+
+// ============================================================
+//              15. 自动移动一个舵机
+// ============================================================
+
+void moveServoToTarget(
+    int &currentAngle,
+    int targetAngle,
+    Servo &servo,
+    unsigned long &lastMove
+)
+{
+    unsigned long currentTime = millis();
+
+
+    // -------------------------
+    // 判断运动时间
+    // -------------------------
+
+    if (currentTime - lastMove < moveInterval)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 如果已经到目标
+    // -------------------------
+
+    if (currentAngle == targetAngle)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 向目标靠近 1°
+    // -------------------------
+
+    if (currentAngle < targetAngle)
+    {
+        currentAngle++;
+    }
+    else
+    {
+        currentAngle--;
+    }
+
+
+    // -------------------------
+    // 输出
+    // -------------------------
+
+    servo.write(currentAngle);
+
+
+    // -------------------------
+    // 记录时间
+    // -------------------------
+
+    lastMove = currentTime;
+}
+
+
+// ============================================================
+//              16. 自动运动系统
+// ============================================================
+
+void updateAutoMovement()
+{
+    // 如果没有自动运动
+    // 直接退出
+
+    if (!autoMoving)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 四个舵机分别向目标移动
+    // -------------------------
+
+    moveServoToTarget(
+        baseAngle,
+        baseTarget,
+        base,
+        lastBaseMove
+    );
+
+
+    moveServoToTarget(
+        rArmAngle,
+        rArmTarget,
+        rArm,
+        lastRArmMove
+    );
+
+
+    moveServoToTarget(
+        fArmAngle,
+        fArmTarget,
+        fArm,
+        lastFArmMove
+    );
+
+
+    moveServoToTarget(
+        clawAngle,
+        clawTarget,
+        claw,
+        lastClawMove
+    );
+
+
+    // -------------------------
+    // 判断是否全部到达
+    // -------------------------
+
+    if (
+        baseAngle == baseTarget &&
+        rArmAngle == rArmTarget &&
+        fArmAngle == fArmTarget &&
+        clawAngle == clawTarget
+    )
+    {
+        autoMoving = false;
+
+        Serial.println("自动运动完成");
+    }
+}
+
+
+// ============================================================
+//                    17. 张开爪子
+// ============================================================
+void openClaw()
+{
+    clawTarget = CLAW_MIN;
+    autoMoving = true;
+
+    Serial.println("爪子：张开");
+}
+
+
+// ============================================================
+//                    18. 关闭爪子
+// ============================================================
+void closeClaw()
+{
+    clawTarget = CLAW_MAX;
+    autoMoving = true;
+
+    Serial.println("爪子：关闭");
+}
+
+
+
+// ============================================================
+//                    19. 加快速度
+// ============================================================
+
+void increaseSpeed()
+{
+    moveInterval -= 10;
+
+
+    if (moveInterval < FASTEST)
+    {
+        moveInterval = FASTEST;
+    }
+
+
+    Serial.print("速度提高，当前间隔：");
+    Serial.print(moveInterval);
+    Serial.println(" ms");
+}
+
+
+// ============================================================
+//                    20. 降低速度
+// ============================================================
+
+void decreaseSpeed()
+{
+    moveInterval += 10;
+
+
+    if (moveInterval > SLOWEST)
+    {
+        moveInterval = SLOWEST;
+    }
+
+
+    Serial.print("速度降低，当前间隔：");
+    Serial.print(moveInterval);
+    Serial.println(" ms");
+}
+
+
+// ============================================================
+//              21. 多舵机协同控制
+// ============================================================
+//
+// 指令格式：
+//
+// x120,y80,z100
+//
+// 我们规定：
+//
+// x → base
+// y → rArm
+// z → fArm
+//
+// 注意：
+// 这里的数字是“绝对角度”
+//
+// 例如：
+//
+// x120,y80,z100
+//
+// 表示：
+// 底座 → 120°
+// 大臂 → 80°
+// 小臂 → 100°
+//
+// ============================================================
+
+void multiServoControl(String command)
+{
+    // -------------------------
+    // 找到 x y z
+    // -------------------------
+
+    int xIndex = command.indexOf('x');
+    int yIndex = command.indexOf('y');
+    int zIndex = command.indexOf('z');
+
+
+    // 同时兼容大写 X Y Z
+
+    if (xIndex == -1)
+    {
+        xIndex = command.indexOf('X');
+    }
+
+    if (yIndex == -1)
+    {
+        yIndex = command.indexOf('Y');
+    }
+
+    if (zIndex == -1)
+    {
+        zIndex = command.indexOf('Z');
+    }
+
+
+    // -------------------------
+    // 找逗号
+    // -------------------------
+
+    int comma1 = command.indexOf(',');
+    int comma2 = command.indexOf(',', comma1 + 1);
+
+
+    // -------------------------
+    // 检查格式
+    // -------------------------
+
+    if (
+        xIndex == -1 ||
+        yIndex == -1 ||
+        zIndex == -1 ||
+        comma1 == -1 ||
+        comma2 == -1
+    )
+    {
+        Serial.println("指令格式错误！");
+        Serial.println("正确格式：x120,y80,z100");
+
+        return;
+    }
+
+
+    // -------------------------
+    // 解析 x
+    // -------------------------
+
+    int xAngle = command.substring(
+        xIndex + 1,
+        comma1
+    ).toInt();
+
+
+    // -------------------------
+    // 解析 y
+    // -------------------------
+
+    int yAngle = command.substring(
+        yIndex + 1,
+        comma2
+    ).toInt();
+
+
+    // -------------------------
+    // 解析 z
+    // -------------------------
+
+    int zAngle = command.substring(
+        zIndex + 1
+    ).toInt();
+
+
+    // -------------------------
+    // 限制角度
+    // -------------------------
+
+    xAngle = constrain(
+        xAngle,
+        BASE_MIN,
+        BASE_MAX
+    );
+
+
+    yAngle = constrain(
+        yAngle,
+        RARM_MIN,
+        RARM_MAX
+    );
+
+
+    zAngle = constrain(
+        zAngle,
+        FARM_MIN,
+        FARM_MAX
+    );
+
+
+    // -------------------------
+    // 设置目标角度
+    // -------------------------
+
+    baseTarget = xAngle;
+    rArmTarget = yAngle;
+    fArmTarget = zAngle;
+
+
+    // -------------------------
+    // 开启自动运动
+    // -------------------------
+
+    autoMoving = true;
+
+
+    // -------------------------
+    // 输出信息
+    // -------------------------
+
+    Serial.println("收到多舵机目标：");
+
+    Serial.print("Base = ");
+    Serial.println(baseTarget);
+
+    Serial.print("rArm = ");
+    Serial.println(rArmTarget);
+
+    Serial.print("fArm = ");
+    Serial.println(fArmTarget);
+}
+
+
+// ============================================================
+//                    22. 串口控制
+// ============================================================
+
+void serialControl()
+{
+    if (Serial.available() <= 0)
+    {
+        return;
+    }
+
+
+    // -------------------------
+    // 读取一整行
+    // -------------------------
+
+    String command = Serial.readStringUntil('\n');
+
+    command.trim();
+
+
+    // -------------------------
+    // 空指令
+    // -------------------------
+
+    if (command.length() == 0)
+    {
+        return;
+    }
+
+
+    // ========================================================
+    // 固定指令
+    // ========================================================
+
+    if (command == "O" || command == "o")
+    {
+        openClaw();
+    }
+
+
+    else if (command == "S" || command == "s")
+    {
+        closeClaw();
+    }
+
+
+    else if (command == "H" || command == "h")
+    {
+        increaseSpeed();
+    }
+
+
+    else if (command == "L" || command == "l")
+    {
+        decreaseSpeed();
+    }
+
+
+    // ========================================================
+    // 多舵机指令
+    // ========================================================
+
+    else if (
+        command.indexOf('x') != -1 ||
+        command.indexOf('X') != -1
+    )
+    {
+        multiServoControl(command);
+    }
+
+
+    // ========================================================
+    // 未知指令
+    // ========================================================
+
+    else
+    {
+        Serial.print("未知指令：");
+        Serial.println(command);
+    }
+}
+
+
+// ============================================================
+//                    23. 主循环
+// ============================================================
+
+void loop()
+{
+    // -------------------------
+    // 处理电脑串口
+    // -------------------------
+
+    serialControl();
+
+
+    // -------------------------
+    // 处理摇杆
+    // -------------------------
+
+    joystickControl();
+
+
+    // -------------------------
+    // 处理自动运动
+    // -------------------------
+
+    updateAutoMovement();
+}
